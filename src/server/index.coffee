@@ -15,7 +15,7 @@ auth = require 'derby-auth'
 nconf = require 'nconf'
 priv = require './private.coffee'
 middleware = require './middleware'
-{helpers} = require("habitrpg-shared")
+helpers = require("habitrpg-shared/script/helpers.coffee")
 
 # Infinite stack trace
 Error.stackTraceLimit = Infinity if nconf.get('NODE_ENV') is 'development'

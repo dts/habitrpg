@@ -6,7 +6,7 @@ _ = require 'lodash'
 validator = require 'derby-auth/node_modules/validator'
 check = validator.check
 sanitize = validator.sanitize
-tasks = require '../app/tasks.coffee'
+u = require '../app/user.coffee'
 
 NO_TOKEN_OR_UID = err: "You must include a token and uid (user id) in your request"
 NO_USER_FOUND = err: "No user found."
@@ -35,70 +35,43 @@ auth = (req, res, next) ->
   return res.json 401, NO_TOKEN_OR_UID unless uid || token
 
   model = req.getModel()
-  query = model.query('users').withIdAndToken(uid, token)
 
-  query.fetch (err, user) ->
+  $priv = model.query 'usersPrivate', {id: uid, apiToken: token, $limit:1}
+  $priv.fetch (err) ->
     return res.json err: err if err
-    req.user = user
-    req.userObj = user.get()
-    return res.json 401, NO_USER_FOUND if !req.userObj || _.isEmpty(req.userObj)
-    req._isServer = true
-    next()
+    return res.json 401, NO_USER_FOUND if _.isEmpty($priv.get()[0])
+
+    $priv = model.at "usersPrivate.#{uid}"
+    $pub = model.at "usersPublic.#{uid}"
+    model.fetch $priv, $pub, (err) ->
+      return res.json err: err if err
+      req.ats = {$priv: $priv, $pub: $pub, id: $priv.get('id')}
+      req.gets = gets = {priv:$priv.get(), pub:$pub.get()}
+      req.uobj = u.transformForAPI gets.pub, gets.priv
+      next()
 
 ###
   GET /user
 ###
 router.get '/user', auth, (req, res) ->
-  user = req.userObj
+  {uobj} = req
 
-  user.stats.toNextLevel = algos.tnl user.stats.lvl
-  user.stats.maxHealth = 50
+  uobj.stats.toNextLevel = algos.tnl uobj.stats.lvl
+  uobj.stats.maxHealth = 50
 
-  delete user.apiToken
-  if user.auth
-    delete user.auth.hashed_password
-    delete user.auth.salt
+  delete uobj.apiToken
+  if uobj.auth
+    delete uobj.auth.hashed_password
+    delete uobj.auth.salt
 
-  res.json user
-
-###
-  TODO POST /user
-  when a put attempt didn't work, create a new one with POST
-###
-
-###
-  PUT /user
-###
-router.put '/user', auth, (req, res) ->
-  user = req.user
-  partialUser = req.body.user
-
-  # REVISIT is this the best way of handling protected v acceptable attr mass-setting? Possible pitfalls: (1) we have to remember
-  # to update here when we add new schema attrs in the future, (2) developers can't assign random variables (which
-  # is currently beneficial for Kevin & Paul). Pros: protects accidental or malicious user data corruption
-
-  # TODO - this accounts for single-nested items (stats.hp, stats.exp) but will clobber any other depth.
-  # See http://stackoverflow.com/a/6394168/362790 for when we need to cross that road
-
-  acceptableAttrs = ['flags', 'history', 'items', 'preferences', 'profile', 'stats']
-  user.set 'lastCron', partialUser.lastCron if partialUser.lastCron?
-  _.each acceptableAttrs, (attr) ->
-    _.each partialUser[attr], (val, key) -> user.set("#{attr}.#{key}", val);true
-    true
-
-  updateTasks partialUser.tasks, req.user, req.getModel() if partialUser.tasks?
-
-  userObj = user.get()
-  userObj.tasks = _.toArray(userObj.tasks) # FIXME figure out how we're going to consistently handle this. should always be array
-  res.json 201, userObj
+  res.json uobj
 
 ###
   GET /user/task/:id
 ###
 router.get '/user/task/:id', auth, (req, res) ->
-  task = req.userObj.tasks[req.params.id]
-  return res.json 400, err: "No task found." if !task || _.isEmpty(task)
-
+  task = req.gets.priv.tasks[req.params.id]
+  return res.json 400, err: "No task found." if _.isEmpty(task)
   res.json 200, task
 
 ###
@@ -110,7 +83,7 @@ validateTask = (req, res, next) ->
 
   # If we're updating, get the task from the user
   if req.method is 'PUT' or req.method is 'DELETE'
-    task = req.ats.$priv.get(req.params.id)
+    task = req.gets.priv.tasks[req.params.id]
     return res.json 400, err: "No task found." if _.isEmpty(task)
     # Strip for now
     type = undefined
@@ -158,7 +131,7 @@ router.delete '/user/task/:id', auth, validateTask, (req, res) ->
   POST /user/tasks
 ###
 updateTasks = (tasks, req) ->
-  {uobj, ats}
+  {uobj, ats} = req
   for idx, task of tasks
     if task.id
       if task.del
@@ -256,6 +229,36 @@ scoreTask = (req, res, next) ->
 ###
 router.post '/user/task/:taskId/:direction', auth, scoreTask
 router.post '/user/tasks/:taskId/:direction', auth, scoreTask
+
+###
+  TODO POST /user
+  when a put attempt didn't work, create a new one with POST
+###
+
+###
+  PUT /user
+###
+router.put '/user', auth, (req, res) ->
+  ats = {req}
+  partialUser = req.body.user
+
+  # REVISIT is this the best way of handling protected v acceptable attr mass-setting? Possible pitfalls: (1) we have to remember
+  # to update here when we add new schema attrs in the future, (2) developers can't assign random variables (which
+  # is currently beneficial for Kevin & Paul). Pros: protects accidental or malicious user data corruption
+
+  # TODO - this accounts for single-nested items (stats.hp, stats.exp) but will clobber any other depth.
+  # See http://stackoverflow.com/a/6394168/362790 for when we need to cross that road
+
+  # acceptable attributes
+  paths = {}
+  ['flags', 'history', 'items', 'preferences', 'profile', 'stats', 'lastCron'].forEach (attr) ->
+    paths[attr] = true if partialUser[attr]?
+  u.setDiff(req.getModel(), partialUser, paths)
+
+  updateTasks(partialUser.tasks, req) if partialUser.tasks?
+
+  uobj = u.transformForAPI ats.$pub.get(), ats.$priv.get()
+  res.json 201, uobj
 
 module.exports = router
 module.exports.auth = auth
